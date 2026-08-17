@@ -6880,7 +6880,9 @@ async function fpSubmit() {
   btn.textContent = 'Sending…';
   btn.disabled = true;
   if(sb) {
-    const { error } = await sb.auth.resetPasswordForEmail(email);
+    const { error } = await sb.auth.resetPasswordForEmail(email, {
+      redirectTo: window.location.origin + window.location.pathname
+    });
     if(error) {
       errEl.textContent = error.message;
       errEl.classList.add('show');
