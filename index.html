@@ -6555,9 +6555,6 @@ async function initAuth() {
     if (sb) sb.auth.signOut().catch(() => {});
   }
 
-  // Returning from a MyFatoorah payment redirect — force a fresh subscription check
-  const returningFromPayment = window.location.search.includes('paymentId');
-
   // Already logged in — verify with Supabase then check subscription
   if (sb && (localStorage.getItem('nutri_user') || sessionStorage.getItem('nutri_user'))) {
     const { data: { user } } = await sb.auth.getUser().catch(() => ({ data: { user: null } }));
@@ -6565,26 +6562,6 @@ async function initAuth() {
       splash.style.display = 'none';
       authWrap.style.display = 'none';
       document.getElementById('ob-wrap').style.display = 'none';
-
-      if (returningFromPayment) {
-        history.replaceState(null, '', window.location.pathname);
-        paywallOpen(false);
-        const checkAndReveal = async () => {
-          const subscribed = await isUserSubscribed();
-          if (subscribed) {
-            document.getElementById('paywall-overlay').style.display = 'none';
-            document.getElementById('app').style.display = '';
-            return true;
-          }
-          return false;
-        };
-        if (!(await checkAndReveal())) {
-          // Webhook may take a moment — retry once more shortly
-          setTimeout(checkAndReveal, 3000);
-        }
-        syncFromCloud();
-        return;
-      }
 
       const cachedSub = localStorage.getItem('nutri_subscribed') === '1';
       if (!cachedSub) {
@@ -6744,19 +6721,29 @@ function paywallOpen(fromAuth) {
   el.style.display = 'flex';
 }
 
-function paywallClose() {
+async function paywallClose() {
   const overlay = document.getElementById('paywall-overlay');
   if (overlay.style.display === 'none') return; // already closed — ignore duplicate/rapid taps
-  overlay.style.display = 'none';
-  document.getElementById('paywall-plans-overlay').style.display = 'none';
   if (_paywallFromAuth) {
-    // Go back to auth screen instead of app
+    // Not a subscription decision — just navigating back to the auth screen
+    overlay.style.display = 'none';
+    document.getElementById('paywall-plans-overlay').style.display = 'none';
     _paywallFromAuth = false;
     const authWrap = document.getElementById('auth-wrap');
     authWrap.style.display = 'flex';
     authWrap.classList.remove('au-hidden');
-  } else {
+    return;
+  }
+  // Hard-enforce: closing the paywall used to reveal the app unconditionally —
+  // that was the free-access loophole. Only actually let them in if they're
+  // genuinely subscribed (isUserSubscribed() still honors the dev-bypass email).
+  const subscribed = await isUserSubscribed();
+  if (subscribed) {
+    overlay.style.display = 'none';
+    document.getElementById('paywall-plans-overlay').style.display = 'none';
     document.getElementById('app').style.display = '';
+  } else {
+    toast('Subscribe to continue using CalOS');
   }
 }
 
@@ -6774,34 +6761,37 @@ function pwShowPlans() {
   const sheet = document.getElementById('paywall-sheet');
   sheet.style.animation = 'none';
   requestAnimationFrame(() => { sheet.style.animation = ''; });
+  pwSelectPlan(_selectedPlan); // set CTA text for the current platform right away
+}
+
+// ── Platform detection ──────────────────────────────────────
+// MyFatoorah has been removed — payment now needs to route to Apple's
+// In-App Purchase (iOS) or Google Play Billing (Android) instead. Neither
+// is wired up yet (both require the app to actually be running inside
+// Capacitor, not the web preview), so this only decides which button to
+// *show* for now. Once Capacitor + StoreKit/Play Billing (or RevenueCat,
+// see paywallRestore() below) are in, this same detectPlatform() call is
+// what should pick which real purchase flow to invoke.
+function detectPlatform() {
+  if (typeof Capacitor !== 'undefined' && Capacitor.getPlatform) {
+    const p = Capacitor.getPlatform(); // 'ios' | 'android' | 'web'
+    if (p === 'ios' || p === 'android') return p;
+  }
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPad|iPod/.test(ua)) return 'ios';
+  if (/Android/.test(ua)) return 'android';
+  return 'web';
 }
 
 async function paywallStart() {
   haptic.medium();
-  if (!sb) { toast('Not connected'); return; }
-  const btn = document.querySelector('.pw-cta');
-  const origText = btn ? btn.textContent : '';
-  if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
-  try {
-    const { data: { session } } = await sb.auth.getSession();
-    if (!session) { toast('Please sign in first'); return; }
-    const res = await fetch(
-      'https://ishmxvljcgwqajrypxee.supabase.co/functions/v1/myfatoorah-create-payment',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
-        body: JSON.stringify({ plan: _selectedPlan, redirectUrl: window.location.origin + window.location.pathname }),
-      }
-    );
-    const data = await res.json();
-    if (!res.ok || !data.url) { toast(data.error || 'Payment failed to start'); return; }
-    haptic.success();
-    window.location.href = data.url;
-  } catch (e) {
-    console.error('paywallStart failed:', e);
-    toast('Payment failed to start — check your connection');
-  } finally {
-    if (btn) { btn.textContent = origText; btn.disabled = false; }
+  const platform = detectPlatform();
+  if (platform === 'ios') {
+    toast('Apple In-App Purchase isn\'t set up yet — coming soon');
+  } else if (platform === 'android') {
+    toast('Google Play Billing isn\'t set up yet — coming soon');
+  } else {
+    toast('Subscriptions aren\'t available in the web preview yet');
   }
 }
 
@@ -6820,12 +6810,14 @@ function pwSelectPlan(plan) {
   const cta = document.querySelector('.pw-cta');
   const fine = document.querySelector('.pw-fine');
   const nopay = document.querySelector('.pw-no-pay');
+  const platform = detectPlatform();
+  const via = platform === 'ios' ? ' with Apple Pay' : platform === 'android' ? ' with Google Play' : '';
   if (plan === 'monthly') {
-    if (cta) cta.textContent = 'Subscribe Monthly';
+    if (cta) cta.textContent = 'Subscribe Monthly' + via;
     if (fine) fine.textContent = '$2.99 per month. Cancel anytime.';
     if (nopay) nopay.style.visibility = 'hidden';
   } else {
-    if (cta) cta.textContent = 'Start My 3-Day Free Trial';
+    if (cta) cta.textContent = 'Start My 3-Day Free Trial' + via;
     if (fine) fine.innerHTML = '3 days free, then $29.99 per year ($2.49/mo).<br>Cancel anytime before trial ends.';
     if (nopay) nopay.style.visibility = '';
   }
@@ -8883,7 +8875,13 @@ async function generateTrainingPlan() {
     btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg> AI Generate`;
     return;
   }
-  try {
+  // Errors worth silently retrying once — occasional AI output-formatting
+  // hiccups (missing/malformed JSON), not real failures. Auth/quota/rate-limit
+  // errors are NOT retried — retrying those wastes a call and can't succeed
+  // any differently, so those go straight to the preset fallback below.
+  const RETRYABLE = new Set(['no JSON', 'bad JSON', 'wrong day count']);
+
+  async function attemptAIPlan() {
     const savedStyles = safeParse('nutri_train_style', ['strength']);
     const styleDesc = Array.isArray(savedStyles) ? savedStyles.join(' + ') : String(savedStyles);
     const trainDays = Validate.int(localStorage.getItem('nutri_train_days'), 1, 7) || 4;
@@ -8904,16 +8902,30 @@ Each workout day should have 4-5 exercises matching the equipment. Rest days hav
     const raw = d.content.map(b=>b.text||'').join('');
     const m = raw.match(/\[[\s\S]*\]/);
     if (!m) throw new Error('no JSON');
-    const plan = JSON.parse(m[0]);
-    if (plan.length === 7) {
-      trainingPlan = plan;
-      saveTrainingPlan();
-      renderTrainingPlan();
-      toast('New plan generated ✓');
-      btn.classList.remove('loading');
-      btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg> AI Generate`;
-      return;
+    let plan;
+    try { plan = JSON.parse(m[0]); } catch { throw new Error('bad JSON'); }
+    if (!Array.isArray(plan) || plan.length !== 7) throw new Error('wrong day count');
+    return plan;
+  }
+
+  try {
+    let plan;
+    try {
+      plan = await attemptAIPlan();
+    } catch (e) {
+      if (RETRYABLE.has(e?.message)) {
+        plan = await attemptAIPlan(); // one silent retry, no toast shown yet
+      } else {
+        throw e;
+      }
     }
+    trainingPlan = plan;
+    saveTrainingPlan();
+    renderTrainingPlan();
+    toast('New plan generated ✓');
+    btn.classList.remove('loading');
+    btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg> AI Generate`;
+    return;
   } catch(e) { console.error('AI plan generation failed:', e); toast('AI unavailable — using preset (' + (e?.message || 'unknown error') + ')'); }
 
   // API failed — build plan from saved user preferences
